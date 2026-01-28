@@ -61,6 +61,11 @@ BH1750 lightMeter;
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
+// === TDS 水质传感器（模拟量） ===
+#define TDS_PIN          34  // ADC1_CH6，只能输入
+#define TDS_MAX_VALUE    900  // TDS最大值
+#define ADC_RESOLUTION   4095  // ESP32 ADC 12位分辨率
+
 DHT dht(DHT_PIN, DHT_TYPE);
 ModbusMaster nodeNH4;
 ModbusMaster nodeTurb;
@@ -195,6 +200,44 @@ bool deleteWiFiConfig(int index) {
   return true;
 }
 
+// 尝试连接 WiFi
+bool connectWiFi(String ssid, String password, unsigned long timeout_ms = 30000) {
+  Serial.printf("正在連接 WiFi: %s\n", ssid.c_str());
+  WiFi.disconnect(true);
+  delay(500);
+  esp_task_wdt_reset();
+  
+  WiFi.begin(ssid.c_str(), password.c_str());
+  
+  unsigned long startTime = millis();
+  int dotCount = 0;
+  
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < timeout_ms) {
+    delay(500);
+    Serial.print(".");
+    esp_task_wdt_reset();
+    dotCount++;
+    if (dotCount % 20 == 0) {
+      Serial.println("");
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi 連接成功！");
+    Serial.printf("IP 地址: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+    // 启用 ESP32 的自动重连功能（作为备用）
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);  // 允许保存连接信息
+    return true;
+  }
+  
+  Serial.println("");
+  Serial.println("WiFi 連接失敗");
+  return false;
+}
+
 // WiFi 网络信息（用于排序）
 struct WiFiNetwork {
   String ssid;
@@ -274,44 +317,6 @@ bool connectBestWiFi() {
   }
   
   Serial.println("所有已保存的 WiFi 網絡連接失敗");
-  return false;
-}
-
-// 尝试连接 WiFi
-bool connectWiFi(String ssid, String password, unsigned long timeout_ms = 30000) {
-  Serial.printf("正在連接 WiFi: %s\n", ssid.c_str());
-  WiFi.disconnect(true);
-  delay(500);
-  esp_task_wdt_reset();
-  
-  WiFi.begin(ssid.c_str(), password.c_str());
-  
-  unsigned long startTime = millis();
-  int dotCount = 0;
-  
-  while (WiFi.status() != WL_CONNECTED && millis() - startTime < timeout_ms) {
-    delay(500);
-    Serial.print(".");
-    esp_task_wdt_reset();
-    dotCount++;
-    if (dotCount % 20 == 0) {
-      Serial.println("");
-    }
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("");
-    Serial.println("WiFi 連接成功！");
-    Serial.printf("IP 地址: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
-    // 启用 ESP32 的自动重连功能（作为备用）
-    WiFi.setAutoReconnect(true);
-    WiFi.persistent(true);  // 允许保存连接信息
-    return true;
-  }
-  
-  Serial.println("");
-  Serial.println("WiFi 連接失敗");
   return false;
 }
 
@@ -715,6 +720,15 @@ void setup() {
   delay(200);
   esp_task_wdt_reset();
 
+  // TDS 传感器初始化（模拟量）
+  Serial.println("初始化 TDS 传感器...");
+  pinMode(TDS_PIN, INPUT);
+  // ESP32 ADC 配置：12位分辨率，11dB衰减（0-3.3V）
+  analogSetAttenuation(ADC_11db);
+  analogSetWidth(12);
+  delay(200);
+  esp_task_wdt_reset();
+
   // RS485 铵离子初始化
   Serial.println("初始化 RS485 铵离子...");
   pinMode(RE_DE_PIN_NH4, OUTPUT);
@@ -920,6 +934,7 @@ void loop() {
   float lux = 0.0;
   float waterTemp = 0.0;
   float turbidity = 0.0;
+  float tds = 0.0;
 
   // 铵离子
   uint8_t resNH4 = safeRead(nodeNH4, 0x0000, 2);
@@ -975,6 +990,28 @@ void loop() {
     Serial.printf("浊度異常 (0x%02X) → 0\n", resTurb);
   }
 
+  esp_task_wdt_reset();
+
+  // TDS 水质传感器（模拟量）
+  // 读取多次取平均值，提高稳定性
+  int tdsSum = 0;
+  int tdsReadings = 10;
+  for (int i = 0; i < tdsReadings; i++) {
+    tdsSum += analogRead(TDS_PIN);
+    delay(10);
+  }
+  int tdsRaw = tdsSum / tdsReadings;
+  
+  // 将ADC值（0-4095）映射到TDS值（0-900）
+  // 假设ADC值线性对应TDS值
+  tds = (float)tdsRaw * TDS_MAX_VALUE / ADC_RESOLUTION;
+  
+  // 限制在有效范围内
+  if (tds < 0) tds = 0;
+  if (tds > TDS_MAX_VALUE) tds = TDS_MAX_VALUE;
+  
+  Serial.printf("TDS: %.1f ppm (ADC: %d)\n", tds, tdsRaw);
+
   // 上傳
   ThingSpeak.setField(1, temp);
   ThingSpeak.setField(2, hum);
@@ -982,6 +1019,7 @@ void loop() {
   ThingSpeak.setField(4, waterTemp);
   ThingSpeak.setField(5, turbidity);
   ThingSpeak.setField(6, nh4);
+  ThingSpeak.setField(8, tds);
 
   // 只有在 WiFi 连接时才上传数据
   if (WiFi.status() == WL_CONNECTED) {
@@ -997,8 +1035,9 @@ void loop() {
 
   Serial.println("循環完成");
 
-  // 将20秒延迟拆分成多个小延迟，每个都重置看门狗
-  for (int i = 0; i < 200; i++) {
+  // 将5分钟（300秒）延迟拆分成多个小延迟，每个都重置看门狗
+  // 5分钟 = 300秒 = 300000ms = 3000 * 100ms
+  for (int i = 0; i < 3000; i++) {
     delay(100);
     esp_task_wdt_reset();
   }

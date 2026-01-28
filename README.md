@@ -8,6 +8,7 @@
   - NH4+（铵离子）浓度（mg/L）
   - 浊度（NTU）
   - 水温（DS18B20）
+  - TDS（总溶解固体）浓度（ppm，0-900）
 
 - **环境参数监测**：
   - 空气温度（DHT11）
@@ -52,6 +53,11 @@
 
 #### 数字传感器
 - **DHT11 温湿度传感器**：GPIO 5
+
+#### 模拟量传感器
+- **TDS 水质传感器**：GPIO 34（ADC1_CH6）
+  - 测量范围：0-900 ppm
+  - 使用 ESP32 内置 ADC（12位分辨率）
 
 ## 软件依赖
 
@@ -146,6 +152,7 @@ const char* writeAPIKey     = "0UWC02XHIMUUKHGK";
 - Field 4: 水温 (°C)
 - Field 5: 浊度 (NTU)
 - Field 6: NH4+ 浓度 (mg/L)
+- Field 8: TDS 浓度 (ppm)
 
 ## 工作流程
 
@@ -161,7 +168,7 @@ const char* writeAPIKey     = "0UWC02XHIMUUKHGK";
    - 读取所有传感器数据
    - 处理异常情况（返回 0 值）
    - 上传数据至 ThingSpeak
-   - 等待 20 秒后重复
+   - 等待 5 分钟（300秒）后重复
 
 ## 注意事项
 
