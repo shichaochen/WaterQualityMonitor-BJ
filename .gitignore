@@ -1,0 +1,35 @@
+# Arduino
+*.hex
+*.elf
+*.bin
+*.eep
+*.lss
+*.sym
+*.map
+*.su
+*.d
+*.o
+*.elf
+*.bin
+*.hex
+*.eep
+*.lss
+*.sym
+*.map
+*.su
+*.d
+*.o
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Build
+build/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
