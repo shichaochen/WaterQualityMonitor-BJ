@@ -8,13 +8,12 @@
 #include <Wire.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <SoftwareSerial.h>
 #include <esp_task_wdt.h>
 
 // === WiFi 配置 ===
 // 默认 WiFi（如果自动配置失败则使用）
-const char* default_ssid     = "room-8816-941";
-const char* default_password = "04851601";
+const char* default_ssid     = "iPhone 11 CSC";
+const char* default_password = "602602602";
 
 // WiFi 配置结构体
 struct WiFiConfig {
@@ -31,23 +30,22 @@ int wifiConfigCount = 0;
 // Web 配置服务器
 WebServer server(80);
 Preferences preferences;
+bool configServerRunning = false; // 配置热点/网页是否正在运行
 
 // === ThingSpeak 配置 ===
 unsigned long channelNumber = 1880892UL;
 const char* writeAPIKey     = "0UWC02XHIMUUKHGK";
 
-// === RS485 配置 ===
+// === RS485 配置（统一总线） ===
 #define BAUDRATE         9600
+#define RS485_RX_PIN     16
+#define RS485_TX_PIN     17
+#define RS485_RE_DE_PIN  4  // 统一的RE/DE控制引脚
 
-#define SLAVE_ID_NH4     1
-#define RX_PIN_NH4       16
-#define TX_PIN_NH4       17
-#define RE_DE_PIN_NH4    4
-
-#define SLAVE_ID_TURB    3
-#define RX_PIN_TURB      12
-#define TX_PIN_TURB      13
-#define RE_DE_PIN_TURB   2
+// RS485传感器从站ID
+#define SLAVE_ID_NH4     1   // 氨氮传感器
+#define SLAVE_ID_PH      2   // pH传感器
+#define SLAVE_ID_TURB    3   // 浊度传感器
 
 // === DHT11 ===
 #define DHT_PIN          5
@@ -55,6 +53,7 @@ const char* writeAPIKey     = "0UWC02XHIMUUKHGK";
 
 // === BH1750 ===
 BH1750 lightMeter;
+bool bh1750Ready = false;
 
 // === DS18B20 水温 ===
 #define ONE_WIRE_BUS     18
@@ -66,19 +65,27 @@ DallasTemperature sensors(&oneWire);
 #define TDS_MAX_VALUE    900  // TDS最大值
 #define ADC_RESOLUTION   4095  // ESP32 ADC 12位分辨率
 
+// === 采样/上传间隔 ===
+static const unsigned long MEASURE_INTERVAL_MS = 300000UL; // 5分钟
+
+// 掉线后多久自动开启配置热点（避免长时间不可配置）
+static const unsigned long CONFIG_AP_TRIGGER_MS = 30000UL; // 30秒
+
 DHT dht(DHT_PIN, DHT_TYPE);
-ModbusMaster nodeNH4;
-ModbusMaster nodeTurb;
+ModbusMaster nodeNH4;   // 氨氮传感器
+ModbusMaster nodePH;    // pH传感器
+ModbusMaster nodeTurb;  // 浊度传感器
 WiFiClient client;
 
-SoftwareSerial SerialTurb(RX_PIN_TURB, TX_PIN_TURB);
-
-// 方向控制函數
-void preNH4() { digitalWrite(RE_DE_PIN_NH4, HIGH); delayMicroseconds(50); }
-void postNH4() { delayMicroseconds(50); digitalWrite(RE_DE_PIN_NH4, LOW); }
-
-void preTurb() { digitalWrite(RE_DE_PIN_TURB, HIGH); delayMicroseconds(50); }
-void postTurb() { delayMicroseconds(50); digitalWrite(RE_DE_PIN_TURB, LOW); }
+// RS485方向控制函数（统一使用同一个RE/DE引脚）
+void preTransmission() { 
+  digitalWrite(RS485_RE_DE_PIN, HIGH); 
+  delayMicroseconds(50); 
+}
+void postTransmission() { 
+  delayMicroseconds(50); 
+  digitalWrite(RS485_RE_DE_PIN, LOW); 
+}
 
 // 安全讀取 Modbus
 uint8_t safeRead(ModbusMaster &node, uint16_t addr, uint16_t qty, unsigned long timeout_ms = 800) {
@@ -203,8 +210,14 @@ bool deleteWiFiConfig(int index) {
 // 尝试连接 WiFi
 bool connectWiFi(String ssid, String password, unsigned long timeout_ms = 30000) {
   Serial.printf("正在連接 WiFi: %s\n", ssid.c_str());
-  WiFi.disconnect(true);
-  delay(500);
+  // 注意：如果正在运行配置热点（AP+STA），不要把模式切走或做“全断开”，否则会导致手机找不到热点
+  if (!configServerRunning) {
+    WiFi.disconnect(true);
+    delay(200);
+  } else {
+    WiFi.disconnect(false);
+    delay(50);
+  }
   esp_task_wdt_reset();
   
   WiFi.begin(ssid.c_str(), password.c_str());
@@ -249,9 +262,14 @@ struct WiFiNetwork {
 bool connectBestWiFi() {
   Serial.println("正在掃描 WiFi 網絡...");
   
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
+  // 如果配置热点在运行，保持 AP+STA，不要切换为 STA（否则 AP 会消失）
+  if (configServerRunning) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
+  WiFi.disconnect(false);
+  delay(50);
   esp_task_wdt_reset();
   
   int n = WiFi.scanNetworks();
@@ -326,9 +344,14 @@ String wifiListHTML = "";
 // 扫描 WiFi 网络并生成列表 HTML
 void scanWiFiNetworks() {
   Serial.println("正在掃描 WiFi 網絡...");
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
+  // 如果配置热点在运行，保持 AP+STA，避免扫描时把 AP 关掉
+  if (configServerRunning) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
+  WiFi.disconnect(false);
+  delay(50);
   
   int n = WiFi.scanNetworks();
   wifiListHTML = "";
@@ -423,6 +446,36 @@ String getConfigPageHTML() {
 // 处理根路径
 void handleRoot() {
   server.send(200, "text/html; charset=UTF-8", getConfigPageHTML());
+}
+
+// 处理 Captive Portal 检测（iOS/Android 自动弹出配置页面）
+void handleCaptivePortal() {
+  // iOS 和 Android 会请求这些路径来检测 Captive Portal
+  // 返回配置页面，让系统自动弹出
+  server.send(200, "text/html; charset=UTF-8", getConfigPageHTML());
+}
+
+// 处理所有未定义的路径（重定向到配置页面）
+void handleNotFound() {
+  // 如果是配置模式，重定向到配置页面
+  if (configServerRunning) {
+    // 检查是否是 Captive Portal 检测请求
+    String host = server.hostHeader();
+    if (host.indexOf("captive.apple.com") >= 0 || 
+        host.indexOf("connectivitycheck.android.com") >= 0 ||
+        host.indexOf("msftconnecttest.com") >= 0 ||
+        host.indexOf("192.168.4.1") >= 0 ||
+        host.length() == 0) {
+      // 返回配置页面，触发 Captive Portal 弹出
+      handleCaptivePortal();
+    } else {
+      // 其他请求重定向到配置页面
+      server.sendHeader("Location", "/", true);
+      server.send(302, "text/plain", "重定向到配置页面...");
+    }
+  } else {
+    server.send(404, "text/plain", "404: Not Found");
+  }
 }
 
 // 处理保存配置
@@ -598,15 +651,20 @@ void handleRescan() {
 void startConfigMode() {
   Serial.println("\n=== 啟動 WiFi 配置模式 ===");
   
+  // 标记先置为 true，确保扫描过程中也不会把 AP 切没
+  configServerRunning = true;
+
   // 在切换到 AP 模式前先扫描 WiFi
   scanWiFiNetworks();
   esp_task_wdt_reset();
   
-  Serial.println("請連接 WiFi 熱點: ESP32-Config");
+  Serial.println("請連接 WiFi 熱點: WaterQualityMonitor");
   Serial.println("然後在瀏覽器中訪問: http://192.168.4.1");
-  
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32-Config", "");
+
+  // AP+STA 并行：既可开热点配置，也可后台继续自动重连
+  WiFi.mode(WIFI_AP_STA);
+  // 显式设置不隐藏、最大连接数；避免某些手机扫描不到
+  WiFi.softAP("WaterQualityMonitor", "", 1 /*channel*/, 0 /*hidden*/, 4 /*max_conn*/);
   
   IPAddress IP = WiFi.softAPIP();
   Serial.printf("配置服務器 IP: %s\n", IP.toString().c_str());
@@ -618,6 +676,14 @@ void startConfigMode() {
   server.on("/clear", handleClear);
   server.on("/status", handleStatus);
   server.on("/rescan", handleRescan);
+  // Captive Portal 检测路径（iOS/Android 自动检测）
+  server.on("/generate_204", handleCaptivePortal);
+  server.on("/hotspot-detect.html", handleCaptivePortal);
+  server.on("/kindle-wifi/wifiredirect.html", handleCaptivePortal);
+  server.on("/success.txt", handleCaptivePortal);
+  server.on("/connecttest.txt", handleCaptivePortal);
+  server.on("/fwlink", handleCaptivePortal);
+  server.onNotFound(handleNotFound);  // 捕获所有未定义的路径
   server.begin();
   Serial.println("配置服務器已啟動");
   Serial.println("可用功能:");
@@ -626,6 +692,17 @@ void startConfigMode() {
   Serial.println("  - http://192.168.4.1/connect : 立即嘗試連接");
   Serial.println("  - http://192.168.4.1/rescan  : 重新掃描 WiFi");
   Serial.println("  - http://192.168.4.1/clear   : 清除所有配置");
+  Serial.println("提示: 連接熱點後，在瀏覽器中輸入任何網址都會自動跳轉到配置頁面");
+}
+
+void stopConfigModeIfRunning() {
+  if (!configServerRunning) return;
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  configServerRunning = false;
+  // 回到 STA 模式即可（保持自动重连逻辑）
+  WiFi.mode(WIFI_STA);
+  Serial.println("已退出配置模式（AP 已关闭）");
 }
 
 void setup() {
@@ -715,8 +792,38 @@ void setup() {
   esp_task_wdt_reset();
 
   Serial.println("初始化 BH1750...");
-  Wire.begin();
-  lightMeter.begin();
+  // 确保 I2C 总线正确初始化（如果之前已经初始化过，这里会重置）
+  Wire.end();  // 先结束之前的I2C连接
+  delay(50);
+  Wire.begin();  // 重新初始化 I2C
+  delay(200);  // 给 I2C 总线足够的稳定时间
+  esp_task_wdt_reset();
+  
+  // 尝试初始化 BH1750，最多重试3次
+  bh1750Ready = false;
+  for (int retry = 0; retry < 3; retry++) {
+    if (retry > 0) {
+      Serial.printf("BH1750 初始化重試 %d/3...\n", retry);
+      delay(500);
+      Wire.end();
+      delay(50);
+      Wire.begin();  // 重新初始化 I2C
+      delay(200);
+    }
+    bh1750Ready = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+    if (bh1750Ready) {
+      Serial.println("BH1750 初始化成功");
+      break;
+    } else {
+      Serial.printf("BH1750 初始化失敗 (嘗試 %d/3)\n", retry + 1);
+    }
+    esp_task_wdt_reset();
+  }
+  
+  if (!bh1750Ready) {
+    Serial.println("BH1750 初始化失敗（稍後將自動重試）");
+    Serial.println("提示: 請檢查 I2C 接線 (SDA=21, SCL=22) 和供電");
+  }
   delay(200);
   esp_task_wdt_reset();
 
@@ -730,24 +837,27 @@ void setup() {
   esp_task_wdt_reset();
 
   // RS485 铵离子初始化
-  Serial.println("初始化 RS485 铵离子...");
-  pinMode(RE_DE_PIN_NH4, OUTPUT);
-  digitalWrite(RE_DE_PIN_NH4, LOW);
-  Serial2.begin(BAUDRATE, SERIAL_8N1, RX_PIN_NH4, TX_PIN_NH4);
+  // RS485 统一总线初始化（氨氮、pH、浊度共用）
+  Serial.println("初始化 RS485 总线（氨氮、pH、浊度）...");
+  pinMode(RS485_RE_DE_PIN, OUTPUT);
+  digitalWrite(RS485_RE_DE_PIN, LOW);
+  Serial2.begin(BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  
+  // 初始化氨氮传感器（Slave ID 1）
   nodeNH4.begin(SLAVE_ID_NH4, Serial2);
-  nodeNH4.preTransmission(preNH4);
-  nodeNH4.postTransmission(postNH4);
-  delay(1000);  // RS485 需要一点时间稳定
-  esp_task_wdt_reset();
-
-  // RS485 浊度初始化
-  Serial.println("初始化 RS485 浊度...");
-  pinMode(RE_DE_PIN_TURB, OUTPUT);
-  digitalWrite(RE_DE_PIN_TURB, LOW);
-  SerialTurb.begin(BAUDRATE);
-  nodeTurb.begin(SLAVE_ID_TURB, SerialTurb);
-  nodeTurb.preTransmission(preTurb);
-  nodeTurb.postTransmission(postTurb);
+  nodeNH4.preTransmission(preTransmission);
+  nodeNH4.postTransmission(postTransmission);
+  
+  // 初始化pH传感器（Slave ID 2）
+  nodePH.begin(SLAVE_ID_PH, Serial2);
+  nodePH.preTransmission(preTransmission);
+  nodePH.postTransmission(postTransmission);
+  
+  // 初始化浊度传感器（Slave ID 3）
+  nodeTurb.begin(SLAVE_ID_TURB, Serial2);
+  nodeTurb.preTransmission(preTransmission);
+  nodeTurb.postTransmission(postTransmission);
+  
   delay(1000);  // RS485 需要一点时间稳定
   esp_task_wdt_reset();
 
@@ -774,6 +884,7 @@ void loop() {
   
   unsigned long now = millis();
   bool isConnected = (WiFi.status() == WL_CONNECTED);
+  static unsigned long disconnectedSince = 0;
   
   // 检测连接状态变化
   if (isConnected && !wasConnected) {
@@ -791,9 +902,21 @@ void loop() {
     lastReconnectAttempt = 0;  // 立即尝试重连
     reconnectAttempts = 0;  // 重置计数，重新开始
   }
+
+  // 记录掉线开始时间；掉线持续一段时间后，自动开启配置热点（便于手机配置/检查）
+  if (!isConnected) {
+    if (disconnectedSince == 0) disconnectedSince = now;
+    if (!configServerRunning && (now - disconnectedSince) >= CONFIG_AP_TRIGGER_MS) {
+      Serial.println("\n⚠️ WiFi 已掉線超過 30 秒，自動開啟配置熱點 WaterQualityMonitor");
+      startConfigMode();
+      configModeTriggered = true;
+    }
+  } else {
+    disconnectedSince = 0;
+  }
   
   // 如果已连接，定期检查连接质量（每30秒）
-  if (isConnected && WiFi.getMode() != WIFI_AP) {
+  if (isConnected) {
     if (now - lastConnectionQualityCheck >= 30000) {
       lastConnectionQualityCheck = now;
       int currentRSSI = WiFi.RSSI();
@@ -824,11 +947,11 @@ void loop() {
   }
   
   // 如果未连接，尝试重连
-  if (!isConnected && WiFi.getMode() != WIFI_AP) {
+  if (!isConnected) {
     // 如果重连失败超过10次，自动进入配置模式
     if (reconnectAttempts >= 10 && !configModeTriggered) {
       Serial.println("\n⚠️ 重連失敗次數過多，自動進入配置模式");
-      Serial.println("請連接 WiFi 熱點 'ESP32-Config' 並訪問 http://192.168.4.1 進行配置");
+      Serial.println("請連接 WiFi 熱點 'WaterQualityMonitor' 並訪問 http://192.168.4.1 進行配置");
       startConfigMode();
       configModeTriggered = true;
       reconnectAttempts = 0;  // 重置计数
@@ -897,16 +1020,13 @@ void loop() {
       Serial.printf("[WiFi 狀態] %d (%s), 等待重連... (已嘗試 %d 次)\n", status, statusText, reconnectAttempts);
     }
   } else if (isConnected) {
-    // 已连接时，定期检查（每60秒）
-    if (now - lastWiFiCheck >= 60000) {
-      lastWiFiCheck = now;
-      // 静默检查，不输出日志，避免干扰
-    }
+    // 已连接，关闭配置热点并停止Web配置（避免干扰）
+    stopConfigModeIfRunning();
     wasConnected = true;
   }
   
-  // 如果在配置模式下，处理 Web 服务器请求
-  if (WiFi.getMode() == WIFI_AP) {
+  // 如果配置服务在运行，处理 Web 服务器请求（即使处于 AP+STA）
+  if (configServerRunning) {
     server.handleClient();
     
     // 在配置模式下，每30秒尝试一次连接（如果用户已配置）
@@ -921,14 +1041,23 @@ void loop() {
           wasConnected = true;
           lastConnectionTime = now;
           lastRSSI = WiFi.RSSI();
+          stopConfigModeIfRunning();
         }
       }
     }
   }
 
+  // === 每5分钟刷新一次参数（非阻塞） ===
+  static unsigned long lastMeasureMs = 0;
+  if (lastMeasureMs != 0 && (now - lastMeasureMs) < MEASURE_INTERVAL_MS) {
+    return;
+  }
+  lastMeasureMs = now;
+
   Serial.println("\n=== 感測器讀取 ===");
 
   float nh4 = 0.0;
+  float ph = 0.0;
   float temp = 0.0;
   float hum = 0.0;
   float lux = 0.0;
@@ -941,9 +1070,57 @@ void loop() {
   if (resNH4 == nodeNH4.ku8MBSuccess) {
     uint32_t raw = ((uint32_t)nodeNH4.getResponseBuffer(0) << 16) | nodeNH4.getResponseBuffer(1);
     nh4 = *(float*)&raw;
-    Serial.printf("NH4+: %.3f mg/L\n", nh4);
+    // 验证数据有效性
+    if (!isnan(nh4) && !isinf(nh4) && nh4 >= 0 && nh4 < 1000) {
+      Serial.printf("NH4+: %.3f mg/L\n", nh4);
+    } else {
+      Serial.printf("NH4+ 數據異常 (值: %.3f) → 0\n", nh4);
+      nh4 = 0.0;
+    }
   } else {
-    Serial.printf("NH4 異常 (0x%02X) → 0\n", resNH4);
+    const char* errorMsg = "";
+    switch(resNH4) {
+      case 0x01: errorMsg = "非法功能"; break;
+      case 0x02: errorMsg = "非法数据地址"; break;
+      case 0x03: errorMsg = "非法数据值"; break;
+      case 0x04: errorMsg = "从站设备故障"; break;
+      case 0xE1: errorMsg = "校验和错误"; break;
+      case 0xE2: errorMsg = "接收超时"; break;
+      case 0xE3: errorMsg = "无效响应"; break;
+      default: errorMsg = "未知错误"; break;
+    }
+    Serial.printf("NH4 讀取失敗: 0x%02X (%s) → 0\n", resNH4, errorMsg);
+    nh4 = 0.0;  // 确保设置为0，上传到ThingSpeak
+  }
+
+  esp_task_wdt_reset();
+
+  // pH值
+  uint8_t resPH = safeRead(nodePH, 0x0000, 1);
+  if (resPH == nodePH.ku8MBSuccess) {
+    uint16_t raw = nodePH.getResponseBuffer(0);
+    ph = raw / 100.0;  // 假设pH值以整数形式存储（如700表示7.00）
+    // 验证数据有效性
+    if (!isnan(ph) && !isinf(ph) && ph >= 0 && ph <= 14) {
+      Serial.printf("pH: %.2f\n", ph);
+    } else {
+      Serial.printf("pH 數據異常 (值: %.2f) → 0\n", ph);
+      ph = 0.0;
+    }
+  } else {
+    const char* errorMsg = "";
+    switch(resPH) {
+      case 0x01: errorMsg = "非法功能"; break;
+      case 0x02: errorMsg = "非法数据地址"; break;
+      case 0x03: errorMsg = "非法数据值"; break;
+      case 0x04: errorMsg = "从站设备故障"; break;
+      case 0xE1: errorMsg = "校验和错误"; break;
+      case 0xE2: errorMsg = "接收超时"; break;
+      case 0xE3: errorMsg = "无效响应"; break;
+      default: errorMsg = "未知错误"; break;
+    }
+    Serial.printf("pH 讀取失敗: 0x%02X (%s) → 0\n", resPH, errorMsg);
+    ph = 0.0;  // 确保设置为0，上传到ThingSpeak
   }
 
   esp_task_wdt_reset();
@@ -960,12 +1137,43 @@ void loop() {
   }
 
   // 光照
-  float l = lightMeter.readLightLevel();
-  if (l >= 0) {
-    lux = l;
-    Serial.printf("光照: %.1f lx\n", lux);
+  static unsigned long lastBH1750Retry = 0;
+  if (!bh1750Ready) {
+    // 每30秒尝试恢复一次 BH1750（避免频繁重试）
+    unsigned long now = millis();
+    if (now - lastBH1750Retry > 30000) {
+      lastBH1750Retry = now;
+      Serial.println("嘗試恢復 BH1750...");
+      Wire.begin();
+      delay(100);
+      bh1750Ready = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+      if (bh1750Ready) {
+        Serial.println("BH1750 已恢復");
+      } else {
+        Serial.println("BH1750 恢復失敗，將在30秒後重試");
+      }
+      esp_task_wdt_reset();
+    }
+  }
+  
+  if (bh1750Ready) {
+    float l = lightMeter.readLightLevel();
+    if (l >= 0 && !isnan(l) && !isinf(l)) {
+      lux = l;
+      Serial.printf("光照: %.1f lx\n", lux);
+    } else {
+      Serial.printf("BH1750 讀取異常 (值: %.2f) → 0\n", l);
+      bh1750Ready = false; // 下次循环重试初始化
+      lastBH1750Retry = millis(); // 重置重试计时
+    }
   } else {
-    Serial.println("BH1750 異常 → 0");
+    // 只在第一次或每30秒输出一次，避免刷屏
+    static unsigned long lastErrorMsg = 0;
+    unsigned long now = millis();
+    if (now - lastErrorMsg > 30000) {
+      lastErrorMsg = now;
+      Serial.println("BH1750 未配置 → 0（將自動重試）");
+    }
   }
 
   // 水溫
@@ -1018,28 +1226,39 @@ void loop() {
   ThingSpeak.setField(3, lux);
   ThingSpeak.setField(4, waterTemp);
   ThingSpeak.setField(5, turbidity);
-  ThingSpeak.setField(6, nh4);
+  ThingSpeak.setField(6, ph);  // pH 值
+  ThingSpeak.setField(7, nh4);  // NH4+ 浓度（氨氮）
   ThingSpeak.setField(8, tds);
 
   // 只有在 WiFi 连接时才上传数据
   if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n=== 上傳數據到 ThingSpeak ===");
+    Serial.printf("Field 1 (溫度): %.1f°C\n", temp);
+    Serial.printf("Field 2 (濕度): %.1f%%\n", hum);
+    Serial.printf("Field 3 (光照): %.1f lx\n", lux);
+    Serial.printf("Field 4 (水溫): %.2f°C\n", waterTemp);
+    Serial.printf("Field 5 (浊度): %.1f NTU\n", turbidity);
+    Serial.printf("Field 6 (pH): %.2f\n", ph);
+    Serial.printf("Field 7 (NH4+): %.3f mg/L\n", nh4);
+    Serial.printf("Field 8 (TDS): %.1f ppm\n", tds);
+    
     int status = ThingSpeak.writeFields(channelNumber, writeAPIKey);
     if (status == 200) {
-      Serial.println("ThingSpeak 上傳成功");
+      Serial.println("✓ ThingSpeak 上傳成功");
     } else {
-      Serial.printf("上傳失敗: %d\n", status);
+      Serial.printf("✗ ThingSpeak 上傳失敗: %d\n", status);
+      if (status == -301) {
+        Serial.println("  錯誤: 字段值無效");
+      } else if (status == -302) {
+        Serial.println("  錯誤: 字段編號無效");
+      } else if (status == 0) {
+        Serial.println("  錯誤: 網絡連接問題");
+      }
     }
   } else {
     Serial.println("WiFi 未連接，跳過數據上傳");
   }
 
   Serial.println("循環完成");
-
-  // 将5分钟（300秒）延迟拆分成多个小延迟，每个都重置看门狗
-  // 5分钟 = 300秒 = 300000ms = 3000 * 100ms
-  for (int i = 0; i < 3000; i++) {
-    delay(100);
-    esp_task_wdt_reset();
-  }
 }
 
